@@ -173,18 +173,10 @@ impl Initializer for PyCArrayType {
         new_type.check_not_initialized(vm)?;
 
         // 1. Get _length_ from class dict first
-        let direct_length = new_type
-            .attributes
-            .read()
-            .get(vm.ctx.intern_str("_length_"))
-            .cloned();
+        let direct_length = new_type.attributes.get(vm.ctx.intern_str("_length_"));
 
         // 2. Get _type_ from class dict first
-        let direct_type = new_type
-            .attributes
-            .read()
-            .get(vm.ctx.intern_str("_type_"))
-            .cloned();
+        let direct_type = new_type.attributes.get(vm.ctx.intern_str("_type_"));
 
         // 3. Find parent StgInfo from MRO (for inheritance)
         // Note: PyType.mro does NOT include self, so no skip needed
@@ -429,7 +421,7 @@ impl Constructor for PyCArray {
         }
 
         // Create array with zero-initialized buffer
-        let buffer = vec![0u8; total_size];
+        let buffer = vm.new_zeroed_bytes(total_size)?;
         let instance = Self(PyCData::from_bytes_with_length(buffer, None, length))
             .into_ref_with_type(vm, cls)?;
 
@@ -511,7 +503,11 @@ impl AsMapping for PyCArray {
 )]
 impl PyCArray {
     #[pyclassmethod]
-    fn __class_getitem__(cls: PyTypeRef, args: PyObjectRef, vm: &VirtualMachine) -> PyGenericAlias {
+    fn __class_getitem__(
+        cls: PyTypeRef,
+        args: PyObjectRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<PyGenericAlias> {
         PyGenericAlias::from_args(cls, args, vm)
     }
 
@@ -990,12 +986,18 @@ impl PyCArray {
         let (range, step, slice_len) = sat_slice.adjust_indices(length);
 
         // other_len = PySequence_Length(value);
-        let items: Vec<PyObjectRef> = vm.extract_elements_with(&value, Ok)?;
-        let other_len = items.len();
+        // Size the operand before consuming it so an unbounded iterable is
+        // rejected without being materialized.
+        let other_len = value
+            .sequence_unchecked()
+            .length(vm)
+            .map_err(|_| vm.new_value_error("Can only assign sequence of same size"))?;
 
         if other_len != slice_len {
             return Err(vm.new_value_error("Can only assign sequence of same size"));
         }
+
+        let items: Vec<PyObjectRef> = vm.extract_elements_with(&value, Ok)?;
 
         // Use SaturatedSliceIter for correct index iteration (handles negative step)
         let iter = SaturatedSliceIter::from_adjust_indices(range, step, slice_len);
@@ -1051,6 +1053,7 @@ impl AsBuffer for PyCArray {
             dim_desc.reverse();
 
             BufferDescriptor {
+                offset: 0,
                 len: buffer_len,
                 readonly: false,
                 itemsize,
@@ -1147,44 +1150,34 @@ fn wchar_array_set_value(
 /// add_getset for c_char arrays - adds 'value' and 'raw' attributes
 /// add_getset((PyTypeObject*)self, CharArray_getsets)
 fn add_char_array_getsets(array_type: &Py<PyType>, vm: &VirtualMachine) {
-    // SAFETY: getset is owned by array_type which outlives the getset
-    let value_getset = unsafe {
-        vm.ctx.new_getset(
-            "value",
-            array_type,
-            char_array_get_value,
-            char_array_set_value,
-        )
-    };
-    let raw_getset = unsafe {
-        vm.ctx
-            .new_getset("raw", array_type, char_array_get_raw, char_array_set_raw)
-    };
+    let value_getset = vm.ctx.new_getset(
+        "value",
+        array_type,
+        char_array_get_value,
+        char_array_set_value,
+    );
+    let raw_getset = vm
+        .ctx
+        .new_getset("raw", array_type, char_array_get_raw, char_array_set_raw);
 
     array_type
         .attributes
-        .write()
         .insert(vm.ctx.intern_str("value"), value_getset.into());
     array_type
         .attributes
-        .write()
         .insert(vm.ctx.intern_str("raw"), raw_getset.into());
 }
 
 /// add_getset for c_wchar arrays - adds only 'value' attribute (no 'raw')
 fn add_wchar_array_getsets(array_type: &Py<PyType>, vm: &VirtualMachine) {
-    // SAFETY: getset is owned by array_type which outlives the getset
-    let value_getset = unsafe {
-        vm.ctx.new_getset(
-            "value",
-            array_type,
-            wchar_array_get_value,
-            wchar_array_set_value,
-        )
-    };
+    let value_getset = vm.ctx.new_getset(
+        "value",
+        array_type,
+        wchar_array_get_value,
+        wchar_array_set_value,
+    );
 
     array_type
         .attributes
-        .write()
         .insert(vm.ctx.intern_str("value"), value_getset.into());
 }

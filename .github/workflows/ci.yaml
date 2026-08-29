@@ -80,7 +80,10 @@ jobs:
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip:ci') }}
     env:
       RUST_BACKTRACE: full
-    name: Run rust tests
+    # Named after the matrix entry rather than left to be named for it: a
+    # generated name lists every value in the entry, so adding or removing one
+    # renames the check and drops it from the required list.
+    name: Run rust tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -165,7 +168,10 @@ jobs:
         if: runner.os == 'Linux'
 
   cargo_check:
-    name: cargo check
+    # Named after the matrix entry rather than left to be named for it: a
+    # generated name lists every value in the entry, so adding or removing one
+    # renames the check and drops it from the required list.
+    name: cargo check (${{ matrix.os }}, ${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     needs:
       - determine_changes
@@ -292,7 +298,10 @@ jobs:
         test_multiprocessing_fork
         test_multiprocessing_forkserver
         test_multiprocessing_spawn
-    name: Run snippets and cpython tests
+    # Named after the matrix entry rather than left to be named for it: a
+    # generated name lists every value in the entry, so adding or removing one
+    # renames the check and drops it from the required list.
+    name: Run snippets and cpython tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -302,8 +311,7 @@ jobs:
             - '-u all'
             - '--timeout 600'
             - '--dont-add-python-opts'
-          env_polluting_tests:
-            - test_set
+          env_polluting_tests: []
           skips: []
           timeout: 50
         - os: ubuntu-latest
@@ -311,8 +319,7 @@ jobs:
             - '-u all'
             - '--timeout 600'
             - '--dont-add-python-opts'
-          env_polluting_tests:
-            - test_set
+          env_polluting_tests: []
           skips: []
           timeout: 60
         - os: windows-2025
@@ -320,8 +327,7 @@ jobs:
             - '-u all'
             - '--timeout 600'
             - '--dont-add-python-opts'
-          env_polluting_tests:
-            - test_set
+          env_polluting_tests: []
           skips: []
           timeout: 50
       fail-fast: false
@@ -465,7 +471,10 @@ jobs:
         run: python -I scripts/whats_left.py ${{ env.CARGO_ARGS }} --features jit
 
   clippy:
-    name: clippy
+    # Named after the matrix entry rather than left to be named for it: a
+    # generated name lists every value in the entry, so adding or removing one
+    # renames the check and drops it from the required list.
+    name: clippy (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     needs:
       - determine_changes
@@ -526,7 +535,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: cargo-bins/cargo-binstall@ead08b90bd7b2e6d81963fb9cf0b7239f66d5db4 # v1.21.0
+      - uses: cargo-bins/cargo-binstall@e00d2c94cc0067b77737821097a62d91c0301baa # v1.21.1
 
       - name: cargo shear
         run: |
@@ -554,10 +563,10 @@ jobs:
           components: rustfmt
 
       - name: actionlint
-        uses: reviewdog/action-actionlint@50842263c20a7c46bd0065b9e624d3c569db061e # v1.73.0
+        uses: reviewdog/action-actionlint@dbe5299849118fd6f099ba563d263d770955a64a # v1.73.2
 
       - name: zizmor
-        uses: zizmorcore/zizmor-action@6fc4b006235f201fdab3722e17240ab420d580e5 # v0.6.1
+        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
 
       - name: restore prek cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -567,7 +576,7 @@ jobs:
 
       - name: install prek
         id: prek
-        uses: j178/prek-action@5337cb91e0fa35a7ff31b9ca345126d8bbbcdf16 # v2.0.6
+        uses: j178/prek-action@4e14d07f9231acabce116ccfca13b13dd9755ece # v3.0.0
         with:
           cache: false
           show-verbose-logs: false
@@ -810,10 +819,10 @@ jobs:
         run: cargo build --profile wasm-release --target wasm32-wasip1 --no-default-features --features freeze-stdlib,stdlib,stdio,importlib,host_env --verbose
       - name: run snippets
         run: |
-          wasmer run --dir "$(pwd)" target/wasm32-wasip1/wasm-release/rustpython.wasm -- "$(pwd)/extra_tests/snippets/stdlib_random.py"
-          wasmer run --dir "$(pwd)" target/wasm32-wasip1/wasm-release/rustpython.wasm -- "$(pwd)/extra_tests/snippets/stdlib_time.py"
+          wasmer run --volume "$(pwd)" target/wasm32-wasip1/wasm-release/rustpython.wasm -- "$(pwd)/extra_tests/snippets/stdlib_random.py"
+          wasmer run --volume "$(pwd)" target/wasm32-wasip1/wasm-release/rustpython.wasm -- "$(pwd)/extra_tests/snippets/stdlib_time.py"
       - name: run cpython unittest
-        run: wasmer run --dir "$(pwd)" target/wasm32-wasip1/wasm-release/rustpython.wasm -- "$(pwd)/Lib/test/test_int.py"
+        run: wasmer run --volume "$(pwd)" target/wasm32-wasip1/wasm-release/rustpython.wasm -- "$(pwd)/Lib/test/test_int.py"
 
   cargo_doc:
     needs:

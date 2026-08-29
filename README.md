@@ -41,7 +41,7 @@ needed to prevent stack overflow on Windows):
 
 ```bash
 $ cd RustPython
-$ cargo run --release demo_closures.py
+$ cargo run --release -- -c 'print("Hello, RustPython!")'
 Hello, RustPython!
 ```
 
@@ -120,7 +120,7 @@ cargo build --target wasm32-wasip1 --no-default-features --features freeze-stdli
 Run by wasmer
 
 ```bash
-wasmer run --dir `pwd` -- target/wasm32-wasip1/release/rustpython.wasm `pwd`/extra_tests/snippets/stdlib_random.py
+wasmer run --volume `pwd` -- target/wasm32-wasip1/release/rustpython.wasm `pwd`/extra_tests/snippets/stdlib_random.py
 ```
 
 Run by wapm

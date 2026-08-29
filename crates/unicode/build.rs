@@ -14,7 +14,9 @@ use std::{
     thread,
 };
 
-use icu_properties::props::{EnumeratedProperty, GeneralCategory, NumericType};
+use icu_properties::props::{
+    BidiClass, EnumeratedProperty, GeneralCategory, NamedEnumeratedProperty, NumericType,
+};
 
 fn generate_unicode_3_2() {
     let path = PathBuf::from(env::var("OUT_DIR").unwrap())
@@ -80,17 +82,23 @@ fn generate_unicode_3_2() {
     write_derived(
         &base,
         "DerivedBidiClass-3.2.0.txt",
-        "BIDI_CLASS",
+        "BIDI_CLASS_DIFF",
         "(u32, u32, BidiClass)",
         NonZeroUsize::new(1).unwrap(),
         &mut writer,
         |start, end, id, _| {
             let id = parse_bidi(id);
-            if id != "BidiClass::LeftToRight" {
-                Some((start, end, id))
-            } else {
-                None
+            for i in start..=end {
+                let legacy = BidiClass::try_from_str(id.rsplit_once("::").unwrap().1)
+                    .expect("Unicode data contains valid variants");
+                let modern = char::from_u32(i).map(BidiClass::for_char);
+
+                if Some(legacy) != modern {
+                    return Some((start, end, id));
+                }
             }
+
+            None
         },
         |writer, mut values| {
             values.sort_unstable_by_key(|(start, _, _)| *start);
@@ -197,6 +205,90 @@ fn generate_numeric_type() {
     );
 }
 
+/// Generate a compressed array of Unicode 3.2 membership.
+///
+/// Membership + diff checks is more efficient than storing the full table for 3.2. The logic is to
+/// default to the latest Unicode if a character exists in 3.2 but isn't different. Membership
+/// is needed because diffs aren't enough - a character may be absent in 3.2 which is different
+/// than returning a default.
+fn generate_membership_3_2() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("unicode")
+        .join("ucd32")
+        .join("UnicodeData-3.2.0.txt");
+    let reader = BufReader::new(File::open(path).unwrap());
+
+    // Parse membership from the first data. Unfortunately, this is largely uncompressed.
+    let mut membership_set = BTreeSet::new();
+    // TODO: Oh my, is this hacky and ugly...
+    let mut range_membership = Vec::new();
+    parse_unicode_3_2(
+        reader,
+        NonZeroUsize::new(1).unwrap(),
+        &mut io::empty(),
+        |start, end, value, _| {
+            if value.ends_with("First>") | value.ends_with("Last>") {
+                // Some lines (literally 20) are compressed ranges, so we have to handle those separately
+                range_membership.push(start);
+            } else {
+                membership_set.insert((start, end));
+            }
+
+            Option::<()>::None
+        },
+        |_writer, _values| {},
+    );
+
+    // Second pass. Compress the ranges.
+    let mut iter = membership_set.iter();
+    let &(mut start_prev, mut end_prev) = iter.next().unwrap();
+    let mut membership = Vec::new();
+
+    for &(start, end) in iter {
+        if start <= end_prev + 1 {
+            end_prev = end_prev.max(end);
+        } else {
+            membership.push((start_prev, end_prev));
+            start_prev = start;
+            end_prev = end;
+        }
+    }
+    membership.push((start_prev, end_prev));
+
+    let (chunks, &[]) = range_membership.as_chunks::<2>() else {
+        panic!("Range membership is always in pairs")
+    };
+    for &chunk in chunks {
+        membership.push(chunk.into());
+    }
+
+    membership.sort_unstable_by_key(|&(start, _)| start);
+
+    let path = PathBuf::from(env::var("OUT_DIR").unwrap())
+        .join("generated")
+        .join("membership_3_2.rs");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut writer = BufWriter::new(File::create(&path).unwrap());
+
+    writeln!(writer, "static MEMBERSHIP_3_2: &[(u32, u32)] = &").unwrap();
+    write!(writer, "{membership:?};").unwrap();
+}
+
+/// Read a numeric value written either on its own or as `numerator/denominator`.
+fn parse_numeric_value(text: &str) -> f64 {
+    let text = text.trim();
+    let (numerator, denominator) = text.split_once('/').unwrap_or((text, "1"));
+    let numerator: f64 = numerator
+        .trim()
+        .parse()
+        .expect("Unicode data contains valid properties");
+    let denominator: f64 = denominator
+        .trim()
+        .parse()
+        .expect("Unicode data contains valid properties");
+    numerator / denominator
+}
+
 fn generate_numeric_value() {
     let path = PathBuf::from(env::var("OUT_DIR").unwrap())
         .join("generated")
@@ -204,14 +296,30 @@ fn generate_numeric_value() {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let mut writer = BufWriter::new(File::create(&path).unwrap());
 
-    // Ideally, this would store the diffs between the two tables. However, we need 3.2.0
-    // membership as well as different chars. The final tables are both smaller than storing the
-    // full 3.2.0 value table.
     let ucd32 = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("unicode")
         .join("ucd32");
+    // `DerivedNumericValues` writes the value rounded to a few digits, so the
+    // fraction `UnicodeData` field 8 spells out is what the value comes from.
+    // A character `UnicodeData` leaves out takes its value from Unihan, where
+    // the rounded field is a whole number and loses nothing.
+    let mut ucd32_fractions = BTreeMap::new();
+    for line in BufReader::new(File::open(ucd32.join("UnicodeData-3.2.0.txt")).unwrap())
+        .lines()
+        .map(Result::unwrap)
+    {
+        let mut fields = line.split(';');
+        let Some(code) = fields.next() else { continue };
+        let Some(numeric) = fields.nth(7) else {
+            continue;
+        };
+        if !numeric.is_empty() {
+            let code = u32::from_str_radix(code.trim(), 16).unwrap();
+            ucd32_fractions.insert(code, parse_numeric_value(numeric));
+        }
+    }
+
     let mut ucd32_diffs = BTreeMap::new();
-    let mut ucd32_member = BTreeSet::new();
     let numeric_32 =
         BufReader::new(File::open(ucd32.join("DerivedNumericValues-3.2.0.txt")).unwrap());
     parse_unicode_3_2(
@@ -219,11 +327,11 @@ fn generate_numeric_value() {
         NonZeroUsize::new(1).unwrap(),
         &mut io::empty(),
         |start, end, value, _| {
-            let value: f64 = value
-                .parse()
-                .expect("Unicode data contains valid properties");
+            let value = ucd32_fractions
+                .get(&start)
+                .copied()
+                .unwrap_or_else(|| parse_numeric_value(value));
             ucd32_diffs.insert((start, end), value);
-            ucd32_member.insert((start, end));
             Option::<()>::None
         },
         |_writer, _values| {},
@@ -238,12 +346,11 @@ fn generate_numeric_value() {
         "DerivedNumericValues.txt",
         "NUMERIC_VALUES",
         "(u32, u32, f64)",
-        NonZeroUsize::new(1).unwrap(),
+        // Field 3 holds the fraction; field 1 rounds it to a few digits.
+        NonZeroUsize::new(3).unwrap(),
         &mut writer,
         |start, end, value, _| {
-            let value: f64 = value
-                .parse()
-                .expect("Unicode data contains valid properties");
+            let value = parse_numeric_value(value);
 
             if ucd32_diffs
                 .get(&(start, end))
@@ -270,26 +377,6 @@ fn generate_numeric_value() {
         write!(writer, "({start}, {end}, {value:?}),").unwrap();
     }
     writeln!(writer, "];").unwrap();
-
-    // Compress membership table
-    let mut iter = ucd32_member.iter();
-    let &(mut start_prev, mut end_prev) = iter.next().unwrap();
-    let mut membership = Vec::new();
-
-    for &(start, end) in iter {
-        if start <= end_prev + 1 {
-            end_prev = end_prev.max(end);
-        } else {
-            membership.push((start_prev, end_prev));
-            start_prev = start;
-            end_prev = end;
-        }
-    }
-    membership.push((start_prev, end_prev));
-    membership.sort_unstable_by_key(|&(start, _)| start);
-
-    writeln!(writer, "static NUMERIC_VAL_EXISTS_32: &[(u32, u32)] = &").unwrap();
-    write!(writer, "{membership:?};").unwrap();
 }
 
 fn generate_unicode_latest() {
@@ -602,10 +689,12 @@ fn main() {
     println!("cargo:rerun-if-changed=unicode/latest");
 
     let t_32 = thread::spawn(generate_unicode_3_2);
+    let t_32_membership = thread::spawn(generate_membership_3_2);
     let t_numeric_type = thread::spawn(generate_numeric_type);
     let t_numeric_value = thread::spawn(generate_numeric_value);
     let t_latest = thread::spawn(generate_unicode_latest);
     t_32.join().unwrap();
+    t_32_membership.join().unwrap();
     t_numeric_type.join().unwrap();
     t_numeric_value.join().unwrap();
     t_latest.join().unwrap();

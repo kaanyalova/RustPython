@@ -272,6 +272,15 @@ impl<'a> AsBag for &'a Context {
 #[derive(Clone, Copy)]
 pub struct PyObjBag<'a>(pub &'a Context);
 
+/// Whether a string constant reads as a name. Those are the ones interned,
+/// the way `all_name_chars` picks them out.
+fn is_name_chars(value: &crate::common::wtf8::Wtf8) -> bool {
+    value
+        .as_bytes()
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 impl ConstantBag for PyObjBag<'_> {
     type Constant = Literal;
 
@@ -281,7 +290,7 @@ impl ConstantBag for PyObjBag<'_> {
             BorrowedConstant::Integer { value } => ctx.new_bigint(value).into(),
             BorrowedConstant::Float { value } => ctx.new_float(value).into(),
             BorrowedConstant::Complex { value } => ctx.new_complex(value).into(),
-            BorrowedConstant::Str { value } if value.len() <= 20 => {
+            BorrowedConstant::Str { value } if is_name_chars(value) => {
                 ctx.intern_str(value).to_object()
             }
             BorrowedConstant::Str { value } => ctx.new_str(value).into(),
@@ -356,7 +365,7 @@ impl ConstantBag for PyVmBag<'_> {
             BorrowedConstant::Integer { value } => ctx.new_bigint(value).into(),
             BorrowedConstant::Float { value } => ctx.new_float(value).into(),
             BorrowedConstant::Complex { value } => ctx.new_complex(value).into(),
-            BorrowedConstant::Str { value } if value.len() <= 20 => {
+            BorrowedConstant::Str { value } if is_name_chars(value) => {
                 ctx.intern_str(value).to_object()
             }
             BorrowedConstant::Str { value } => ctx.new_str(value).into(),
@@ -601,7 +610,7 @@ impl Representable for PyCode {
     fn repr_str(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
         let code = &zelf.code;
         Ok(format!(
-            "<code object {} at {:#x} file {:?}, line {}>",
+            "<code object {} at {:#x}, file \"{}\", line {}>",
             code.obj_name,
             zelf.get_id(),
             zelf.source_path().as_str(),
@@ -842,7 +851,8 @@ impl Constructor for PyCode {
             } else {
                 None
             },
-            max_stackdepth: args.stacksize,
+            // Room for one value is always reserved, even where nothing is pushed.
+            max_stackdepth: args.stacksize.max(1),
             obj_name: vm.ctx.intern_str(args.name.as_wtf8()),
             qualname: vm.ctx.intern_str(args.qualname.as_wtf8()),
             constants,
@@ -1352,10 +1362,12 @@ impl PyCode {
             OptionalArg::Missing => self.code.qualname.to_owned(),
         };
 
+        // Room for one value is always reserved, even where nothing is pushed.
         let max_stackdepth = match co_stacksize {
             OptionalArg::Present(stacksize) => stacksize,
             OptionalArg::Missing => self.code.max_stackdepth,
-        };
+        }
+        .max(1);
 
         let instructions = match co_code {
             OptionalArg::Present(code_bytes) => {
