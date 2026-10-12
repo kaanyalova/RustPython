@@ -73,8 +73,11 @@ termios = { workspace = true }
 memmap2 = { workspace = true }
 libloading = { workspace = true, optional = true }
 
-[target.'cfg(all(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android"), not(any(target_env = "musl", target_env = "sgx"))))'.dependencies]
+[target.'cfg(all(any(target_os = "linux", target_os = "macos", target_os = "windows"), not(any(target_env = "musl", target_env = "sgx"))))'.dependencies]
 libffi = { workspace = true, features = ["system"], optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+libffi = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 system-configuration = { workspace = true }
