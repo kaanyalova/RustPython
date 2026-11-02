@@ -124,15 +124,62 @@ pub(crate) mod _thread {
     }
 
     macro_rules! acquire_lock_impl {
-        ($mu:expr, $blocking:expr, $timeout:expr, $vm:expr) => {{
+        ($mu:expr, $blocking:expr, $timeout:expr, $vm:expr) => {{ acquire_lock_impl!($mu, $blocking, $timeout, $vm, false) }};
+        ($mu:expr, $blocking:expr, $timeout:expr, $vm:expr, $owned:expr) => {{
             let (mu, blocking, timeout, vm) = ($mu, $blocking, $timeout, $vm);
-            match blocking {
-                true if timeout == -1.0 => {
-                    vm.allow_threads(|| mu.lock());
-                    Ok(true)
+            let started = std::time::Instant::now();
+            // CPython rounds positive timeouts up to the next nanosecond.
+            let timeout = (timeout != -1.0)
+                .then(|| Duration::from_nanos((timeout * 1_000_000_000.0).ceil() as u64));
+            let mut remaining = timeout;
+            loop {
+                // Ownership gained in a signal handler does not make an
+                // already pending acquisition recursive.
+                let owned = $owned;
+                if !owned && mu.try_lock() {
+                    break Ok(true);
                 }
-                true => Ok(vm.allow_threads(|| mu.try_lock_for(Duration::from_secs_f64(timeout)))),
-                false => Ok(mu.try_lock()),
+                if !blocking || remaining.is_some_and(|remaining| remaining.is_zero()) {
+                    break Ok(false);
+                }
+                if vm
+                    .state
+                    .finalizing
+                    .load(core::sync::atomic::Ordering::Acquire)
+                {
+                    // Other Python threads cannot release the lock once
+                    // finalization begins. Uncontested calls still work.
+                    break Err(vm.new_python_finalization_error(
+                        "cannot acquire lock at interpreter finalization",
+                    ));
+                }
+                let interval = Duration::from_millis(50);
+                let wait = match timeout {
+                    Some(timeout) => match timeout.checked_sub(started.elapsed()) {
+                        Some(remaining) if !remaining.is_zero() => remaining.min(interval),
+                        _ => break Ok(false),
+                    },
+                    None => interval,
+                };
+                // parking_lot waits are not interrupted by OS signals. Poll
+                // without restarting the deadline or acquiring a lock before
+                // running callbacks. A handler may itself retain an RLock.
+                let acquired = vm.allow_threads(|| {
+                    if owned {
+                        thread::sleep(wait);
+                        false
+                    } else {
+                        mu.try_lock_for(wait)
+                    }
+                });
+                if acquired {
+                    break Ok(true);
+                }
+                if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
+                    break Ok(false);
+                }
+                vm.check_signals()?;
+                remaining = timeout.map(|timeout| timeout.saturating_sub(started.elapsed()));
             }
         }};
     }
@@ -247,7 +294,18 @@ pub(crate) mod _thread {
     #[pyclass(with(Representable), flags(BASETYPE, HAS_WEAKREF))]
     impl Py<RLock> {
         #[pyslot]
-        fn slot_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+        fn slot_new(cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+            let rlock_type = RLock::class(&vm.ctx);
+            let cls_init = cls.slots.init.load().map(crate::types::fn_addr);
+            let rlock_init = rlock_type.slots.init.load().map(crate::types::fn_addr);
+            if cls.is(rlock_type) || cls_init == rlock_init {
+                if !args.args.is_empty() {
+                    return Err(vm.new_type_error("RLock() takes no positional arguments"));
+                }
+                if !args.kwargs.is_empty() {
+                    return Err(vm.new_type_error("RLock() takes no keyword arguments"));
+                }
+            }
             RLock {
                 mu: RawRMutex::INIT,
                 count: core::sync::atomic::AtomicUsize::new(0),
@@ -267,7 +325,13 @@ pub(crate) mod _thread {
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 return Ok(true);
             }
-            let result = acquire_lock_impl!(&self.mu, blocking, timeout, vm)?;
+            let result = acquire_lock_impl!(
+                &self.mu,
+                blocking,
+                timeout,
+                vm,
+                self.mu.is_owned_by_current_thread()
+            )?;
             if result {
                 self.count.store(1, core::sync::atomic::Ordering::Relaxed);
             }
@@ -514,8 +578,13 @@ pub(crate) mod _thread {
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let os_name = vm.fsencode(&name)?;
-            host_thread::set_current_thread_name_bytes(os_name.as_encoded_bytes());
+            let os_name = vm.state.codec_registry.encode_text(
+                name,
+                "utf-8",
+                Some(vm.ctx.new_utf8_str("replace")),
+                vm,
+            )?;
+            host_thread::set_current_thread_name_bytes(os_name.as_bytes());
         }
         Ok(())
     }
@@ -736,12 +805,12 @@ pub(crate) mod _thread {
         func: &ArgCallable,
         vm: &VirtualMachine,
     ) {
-        let msg = func
-            .as_ref()
-            .repr(vm)
-            .ok()
-            .map(|repr| format!("Exception ignored in thread started by {}", repr.as_wtf8()));
-        vm.run_unraisable(exc, msg, vm.ctx.none());
+        let msg = func.as_ref().repr(vm).ok().map(|repr| {
+            let mut message = Wtf8Buf::from("Exception ignored in thread started by ");
+            message.push_wtf8(repr.as_wtf8());
+            vm.ctx.new_str(message)
+        });
+        vm.run_unraisable_with_message(exc, msg, vm.ctx.none());
     }
 
     fn run_thread(func: ArgCallable, args: FuncArgs, vm: &VirtualMachine) {
@@ -769,6 +838,7 @@ pub(crate) mod _thread {
         // Clean up thread-local storage while VM context is still active
         // This ensures __del__ methods are called properly
         cleanup_thread_local_data();
+        vm.clear_async_exception();
         // Clean up frame tracking
         crate::vm::thread::cleanup_current_thread_frames(vm);
         vm.state.thread_count.fetch_sub(1);
@@ -1500,37 +1570,15 @@ pub(crate) mod _thread {
                     return false;
                 };
 
-                // Reinit this per-handle lock in case a dead thread held it
-                reinit_parking_lot_mutex(&inner);
-                let mut inner_guard = inner.lock();
-
-                if inner_guard.ident == current_ident {
-                    return true;
-                }
-                if inner_guard.state == ThreadHandleState::NotStarted {
-                    return true;
-                }
-
-                inner_guard.state = ThreadHandleState::Done;
-                // The OS thread did not survive the fork. Dropping JoinHandle
-                // would pthread_detach a copied thread descriptor.
-                if let Some(handle) = inner_guard.join_handle.take() {
-                    core::mem::forget(handle);
-                }
-                drop(inner_guard);
-
-                // Reinit and set the done event. Do not notify: no other
-                // thread exists in the child, and notify_all would unpark
-                // waiters that did not survive the fork.
-                let (lock, cvar) = &*done_event;
-                reinit_parking_lot_mutex(lock);
-                reinit_parking_lot_condvar(cvar);
-                *lock.lock() = true;
+                // SAFETY: only the forking thread survives in the child.
+                unsafe { reinit_handle_after_fork(&inner, &done_event, current_ident) };
 
                 true
             });
         }
 
+        // Every shutdown entry comes from ThreadHandle::new and is also in
+        // thread_handles, so its completion event was already reset above.
         // Clean up shutdown_handles.
         {
             let mut handles = vm.state.shutdown_handles.lock();
@@ -1563,6 +1611,42 @@ pub(crate) mod _thread {
                 false
             });
         }
+    }
+
+    /// Repair a copied handle before any child thread cleanup or join.
+    ///
+    /// Unlike CPython's atomic completion event, ours includes a mutex that a
+    /// parent joiner can hold while detached. Even the surviving thread's
+    /// completion mutex and condvar must lose that dead owner's/waiter's state.
+    /// Its completion value remains unchanged until the thread really exits.
+    ///
+    /// # Safety
+    /// Only call in the single-threaded post-fork child, with no live guards or
+    /// waiters on these locks.
+    #[cfg(all(unix, feature = "host_env"))]
+    unsafe fn reinit_handle_after_fork(
+        inner: &parking_lot::Mutex<ThreadHandleInner>,
+        done_event: &(parking_lot::Mutex<bool>, parking_lot::Condvar),
+        current_ident: u64,
+    ) {
+        reinit_parking_lot_mutex(inner);
+        let (lock, cvar) = done_event;
+        reinit_parking_lot_mutex(lock);
+        reinit_parking_lot_condvar(cvar);
+        let mut inner_guard = inner.lock();
+        if inner_guard.ident == current_ident || inner_guard.state == ThreadHandleState::NotStarted
+        {
+            return;
+        }
+
+        inner_guard.state = ThreadHandleState::Done;
+        // The OS thread did not survive. Do not pthread_detach a copied handle.
+        if let Some(handle) = inner_guard.join_handle.take() {
+            core::mem::forget(handle);
+        }
+        drop(inner_guard);
+        // Do not notify waiters: none survived the fork.
+        *lock.lock() = true;
     }
 
     /// Take a thread handle's completion mutex, detaching first.
@@ -2157,6 +2241,7 @@ pub(crate) mod _thread {
 
                     // Clean up thread-local data while VM context is still active
                     cleanup_thread_local_data();
+                    vm.clear_async_exception();
 
                     // Clean up frame tracking
                     crate::vm::thread::cleanup_current_thread_frames(vm);
@@ -2252,10 +2337,78 @@ pub(crate) mod _thread {
 
     #[cfg(test)]
     mod tests {
-        #[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
+        #[cfg(any(
+            all(unix, feature = "host_env"),
+            all(debug_assertions, any(target_os = "linux", target_os = "macos"))
+        ))]
         use super::*;
         #[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
         use crate::Interpreter;
+
+        /// Exercise only the native completion-state invariant, without Python
+        /// execution or actual fork in the multithreaded Rust test harness.
+        #[test]
+        #[cfg(all(unix, feature = "host_env"))]
+        fn fork_reinitializes_surviving_handle_completion_lock() {
+            for (ident, state, completed, expected_state, expected_completed) in [
+                (
+                    7,
+                    ThreadHandleState::Running,
+                    false,
+                    ThreadHandleState::Running,
+                    false,
+                ),
+                (
+                    0,
+                    ThreadHandleState::NotStarted,
+                    false,
+                    ThreadHandleState::NotStarted,
+                    false,
+                ),
+                (
+                    8,
+                    ThreadHandleState::Running,
+                    false,
+                    ThreadHandleState::Done,
+                    true,
+                ),
+                (
+                    8,
+                    ThreadHandleState::Done,
+                    true,
+                    ThreadHandleState::Done,
+                    true,
+                ),
+            ] {
+                let inner = parking_lot::Mutex::new(ThreadHandleInner {
+                    state,
+                    ident,
+                    join_handle: None,
+                    joining: false,
+                    joined: false,
+                });
+                let done_event = (
+                    parking_lot::Mutex::new(completed),
+                    parking_lot::Condvar::new(),
+                );
+                // Model the bytes inherited from a parent joiner that held the
+                // mutex at fork. No guard remains live and no other thread can
+                // access these exclusively owned fixtures.
+                core::mem::forget(done_event.0.lock());
+                assert!(done_event.0.try_lock().is_none());
+                // SAFETY: these private fixtures have no live guards/waiters,
+                // exactly as in a child after its parent lock owner vanished.
+                unsafe { reinit_handle_after_fork(&inner, &done_event, 7) };
+                let completed = done_event
+                    .0
+                    .try_lock()
+                    .expect("copied completion lock must be unlocked");
+                assert_eq!(*completed, expected_completed);
+                let inner = inner.lock();
+                assert_eq!(inner.state, expected_state);
+                assert_eq!(inner.ident, ident);
+            }
+        }
 
         /// Regression test for #7941: a Python thread started without an
         /// explicit `threading.stack_size()` must not run on Rust's 2 MiB

@@ -97,6 +97,10 @@ impl<'fd, KW: DirFdKeyword> DirFd<'fd, 1, KW> {
 impl<const AVAILABLE: usize, KW: DirFdKeyword> FromArgs for DirFd<'_, AVAILABLE, KW> {
     const PARAMS: Option<&'static [Param]> = Some(KW::PARAMS);
 
+    fn arity() -> core::ops::RangeInclusive<usize> {
+        0..=0
+    }
+
     fn from_args(vm: &VirtualMachine, args: &mut FuncArgs) -> Result<Self, ArgumentError> {
         let fd = match args.take_keyword(KW::NAME) {
             Some(o) if vm.is_none(&o) => Ok(DEFAULT_DIR_FD),
@@ -139,6 +143,20 @@ pub(crate) struct SymlinkArgs<'fd> {
 pub(super) struct FollowSymlinks(
     #[pyarg(named, name = "follow_symlinks", default = true)] pub bool,
 );
+
+#[derive(FromArgs)]
+pub(super) struct AccessArgs<'fd> {
+    #[pyarg(any)]
+    pub(super) path: OsPath,
+    #[pyarg(any)]
+    pub(super) mode: u8,
+    #[pyarg(flatten)]
+    pub(super) dir_fd: DirFd<'fd, { _os::ACCESS_DIR_FD as usize }>,
+    #[pyarg(named, default)]
+    pub(super) effective_ids: bool,
+    #[pyarg(flatten)]
+    pub(super) follow_symlinks: FollowSymlinks,
+}
 
 #[cfg(not(windows))]
 fn bytes_as_os_str<'a>(b: &'a [u8], vm: &VirtualMachine) -> PyResult<&'a std::ffi::OsStr> {
@@ -209,16 +227,17 @@ pub(super) mod _os {
     #[cfg(any(unix, windows))]
     use crate::utils::ToCString;
     use crate::{
-        AsObject, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject,
+        AsObject, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult,
         builtins::{
-            PyBytesRef, PyFloat, PyGenericAlias, PyIntRef, PyStrRef, PyTuple, PyTupleRef, PyTypeRef,
+            PyBytes, PyBytesRef, PyFloat, PyGenericAlias, PyIntRef, PyStr, PyStrRef, PyTuple,
+            PyTupleRef, PyTypeRef,
         },
         class::PyClassDef,
         common::lock::{OnceCell, PyRwLock},
         convert::{IntoPyException, ToPyException, ToPyObject},
         exceptions::{OSErrorBuilder, ToOSErrorBuilder},
         function::{
-            ArgBytesLike, ArgMemoryBuffer, ArgumentError, FromArgs, FsPath, FuncArgs, Param,
+            ArgBytesLike, ArgMemoryBuffer, ArgumentError, Either, FromArgs, FsPath, FuncArgs, Param,
         },
         host_env::crt_fd,
         ospath::{OsPath, OsPathOrFd, OutputMode, PathConverter},
@@ -243,6 +262,15 @@ pub(super) mod _os {
     use rustpython_host_env::posix as host_posix;
     use std::{fs, io, path::PathBuf, time::SystemTime};
 
+    pub(crate) const ACCESS_DIR_FD: bool = cfg!(all(
+        unix,
+        not(any(
+            target_os = "android",
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "vita",
+        ))
+    ));
     const OPEN_DIR_FD: bool = cfg!(not(any(windows, target_os = "redox")));
     pub(crate) const MKDIR_DIR_FD: bool = cfg!(any(unix, target_os = "wasi"));
     const STAT_DIR_FD: bool = cfg!(not(any(windows, target_os = "redox")));
@@ -288,6 +316,10 @@ pub(super) mod _os {
     #[cfg(any(unix, windows, target_os = "wasi"))]
     impl FromArgs for OpenDirFd {
         const PARAMS: Option<&'static [Param]> = Some(DefaultDirFd::PARAMS);
+
+        fn arity() -> core::ops::RangeInclusive<usize> {
+            0..=0
+        }
 
         fn from_args(vm: &VirtualMachine, args: &mut FuncArgs) -> Result<Self, ArgumentError> {
             let fd = match args.take_keyword("dir_fd") {
@@ -403,6 +435,7 @@ pub(super) mod _os {
             match vm.allow_threads(|| crt_fd::read(fd, &mut buffer)) {
                 Ok(n) => {
                     buffer.truncate(n);
+                    buffer.shrink_to_fit();
                     return Ok(vm.ctx.new_bytes(buffer));
                 }
                 Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
@@ -459,9 +492,9 @@ pub(super) mod _os {
 
     #[pyfunction]
     fn write(fd: crt_fd::Borrowed<'_>, data: ArgBytesLike, vm: &VirtualMachine) -> PyResult<usize> {
-        let owned = data.with_ref(|b| b.to_vec());
+        let buffer = data.borrow_buf_unlocked(vm)?;
         loop {
-            match vm.allow_threads(|| crt_fd::write(fd, &owned)) {
+            match vm.allow_threads(|| crt_fd::write(fd, &buffer)) {
                 Ok(n) => return Ok(n),
                 Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
                     vm.check_signals()?;
@@ -538,19 +571,41 @@ pub(super) mod _os {
             .unwrap_or_else(|| OsPathOrFd::Path(OsPath::new_str(".")));
         let list = match path {
             OsPathOrFd::Path(path) => {
-                let dir_iter = match crate::host_env::fs::read_dir(&path) {
-                    Ok(iter) => iter,
-                    Err(err) => {
-                        return Err(OSErrorBuilder::with_filename(&err, path, vm));
+                #[cfg(windows)]
+                {
+                    let wide = path
+                        .path
+                        .to_wide_cstring()
+                        .map_err(|err| OSErrorBuilder::with_filename(&err, path.clone(), vm))?;
+                    let mut dir = host_nt::scandir(&wide)
+                        .map_err(|err| OSErrorBuilder::with_filename(&err, path.clone(), vm))?;
+                    let mut names = Vec::new();
+                    while let Some(entry) = dir
+                        .next_entry()
+                        .map_err(|err| OSErrorBuilder::with_filename(&err, path.clone(), vm))?
+                    {
+                        if !entry.is_dot_or_dotdot() {
+                            names.push(path.mode().process_path(entry.name, vm));
+                        }
                     }
-                };
-                let mode = path.mode();
-                dir_iter
-                    .map(|entry| match entry {
-                        Ok(entry_path) => Ok(mode.process_path(entry_path.file_name(), vm)),
-                        Err(err) => Err(OSErrorBuilder::with_filename(&err, path.clone(), vm)),
-                    })
-                    .collect::<PyResult<_>>()?
+                    names
+                }
+                #[cfg(not(windows))]
+                {
+                    let dir_iter = match crate::host_env::fs::read_dir(&path) {
+                        Ok(iter) => iter,
+                        Err(err) => {
+                            return Err(OSErrorBuilder::with_filename(&err, path, vm));
+                        }
+                    };
+                    let mode = path.mode();
+                    dir_iter
+                        .map(|entry| match entry {
+                            Ok(entry_path) => Ok(mode.process_path(entry_path.file_name(), vm)),
+                            Err(err) => Err(OSErrorBuilder::with_filename(&err, path.clone(), vm)),
+                        })
+                        .collect::<PyResult<_>>()?
+                }
             }
             OsPathOrFd::Fd(fno) => {
                 #[cfg(not(all(unix, not(target_os = "redox"))))]
@@ -1744,7 +1799,7 @@ pub(super) mod _os {
 
     #[pyfunction]
     fn _exit(status: ExitStatus) {
-        crate::host_env::os::exit(status.status)
+        crate::host_env::os::exit_immediately(status.status)
     }
 
     #[pyfunction]
@@ -1910,41 +1965,35 @@ pub(super) mod _os {
     }
 
     fn file_time(obj: &PyObject, vm: &VirtualMachine) -> PyResult<FileTime> {
-        if let Some(float) = obj.downcast_ref::<PyFloat>() {
-            let value = float.to_f64();
-            if value.is_nan() {
-                return Err(vm.new_value_error("Invalid value NaN (not a number)"));
-            }
-            let mut seconds = value.trunc();
-            let mut nanoseconds = (value.fract() * 1_000_000_000.0).floor();
-            if nanoseconds < 0.0 {
-                nanoseconds += 1_000_000_000.0;
-                seconds -= 1.0;
-            }
-            let minimum = FileTimeSeconds::MIN as f64;
-            // The signed maximum rounds up when represented by f64.
-            if !(minimum..-minimum).contains(&seconds) {
-                return Err(vm.new_overflow_error("timestamp out of range for platform time_t"));
-            }
-            Ok(FileTime {
-                seconds: seconds as FileTimeSeconds,
-                nanoseconds: nanoseconds as libc::c_long,
-            })
-        } else {
-            let seconds = match file_time_seconds(obj, vm) {
-                Err(err) if err.fast_isinstance(vm.ctx.exceptions.type_error) => {
-                    return Err(vm.new_type_error(format!(
-                        "argument must be int or float, not {}",
-                        obj.class().fully_qualified_name(vm)?
-                    )));
-                }
-                result => result?,
-            };
-            Ok(FileTime {
-                seconds,
+        if obj.number().is_index() {
+            return Ok(FileTime {
+                seconds: file_time_seconds(obj, vm)?,
                 nanoseconds: 0,
-            })
+            });
         }
+        let value = if let Some(float) = obj.downcast_ref::<PyFloat>() {
+            float.to_f64()
+        } else {
+            obj.try_float(vm)?.to_f64()
+        };
+        if value.is_nan() {
+            return Err(vm.new_value_error("Invalid value NaN (not a number)"));
+        }
+        let mut seconds = value.trunc();
+        let mut nanoseconds = (value.fract() * 1_000_000_000.0).floor();
+        if nanoseconds < 0.0 {
+            nanoseconds += 1_000_000_000.0;
+            seconds -= 1.0;
+        }
+        let minimum = FileTimeSeconds::MIN as f64;
+        // The signed maximum rounds up when represented by f64.
+        if !(minimum..-minimum).contains(&seconds) {
+            return Err(vm.new_overflow_error("timestamp out of range for platform time_t"));
+        }
+        Ok(FileTime {
+            seconds: seconds as FileTimeSeconds,
+            nanoseconds: nanoseconds as libc::c_long,
+        })
     }
 
     #[pyfunction]
@@ -2182,9 +2231,30 @@ pub(super) mod _os {
         crate::host_env::time::strerror(code)
     }
 
-    #[pyfunction]
     pub(crate) fn ftruncate(fd: crt_fd::Borrowed<'_>, length: crt_fd::Offset) -> io::Result<()> {
         crt_fd::ftruncate(fd, length)
+    }
+
+    #[pyfunction(name = "ftruncate")]
+    fn py_ftruncate(fd: i32, length: crt_fd::Offset, vm: &VirtualMachine) -> PyResult<()> {
+        ftruncate_impl(fd, length, vm)
+    }
+
+    fn ftruncate_impl(
+        fd: crt_fd::Raw,
+        length: crt_fd::Offset,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        use crate::host_env::os::ErrorExt;
+
+        vm.audit("os.truncate", || (fd, length))?;
+        loop {
+            match vm.allow_threads(|| crt_fd::ftruncate_raw(fd, length)) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.posix_errno() == libc::EINTR => vm.check_signals()?,
+                Err(err) => return Err(err.into_pyexception(vm)),
+            }
+        }
     }
 
     #[derive(FromArgs)]
@@ -2192,17 +2262,35 @@ pub(super) mod _os {
         #[pyarg(any)]
         path: PyObjectRef,
         #[pyarg(any)]
-        length: crt_fd::Offset,
+        length: PyObjectRef,
     }
 
     #[pyfunction]
     fn truncate(args: TruncateArgs, vm: &VirtualMachine) -> PyResult<()> {
         let TruncateArgs { path, length } = args;
-        match path.clone().try_into_value::<crt_fd::Borrowed<'_>>(vm) {
-            Ok(fd) => return ftruncate(fd, length).map_err(|e| e.into_pyexception(vm)),
-            Err(e) if e.fast_isinstance(vm.ctx.exceptions.warning) => return Err(e),
-            Err(_) => {}
-        }
+        let index =
+            if path.downcast_ref::<PyStr>().is_some() || path.downcast_ref::<PyBytes>().is_some() {
+                None
+            } else {
+                path.try_index_opt(vm)
+            };
+        let path = if let Some(index) = index {
+            super::warn_if_bool_fd(&path, vm)?;
+            Either::A(index?.try_to_primitive::<crt_fd::Raw>(vm)?)
+        } else {
+            Either::B(
+                PathConverter::new()
+                    .function("truncate")
+                    .try_path_inner(path, true, vm)?,
+            )
+        };
+        let length = length.try_into_value::<crt_fd::Offset>(vm)?;
+        let path = match path {
+            Either::A(fd) => {
+                return ftruncate_impl(fd, length, vm);
+            }
+            Either::B(path) => path,
+        };
 
         #[cold]
         fn error(
@@ -2213,7 +2301,8 @@ pub(super) mod _os {
             OSErrorBuilder::with_filename(&error, path, vm)
         }
 
-        let path = OsPath::try_from_object(vm, path)?;
+        vm.audit("os.truncate", || (path.filename(vm), length))?;
+
         // TODO: just call libc::truncate() on POSIX
         let f = match crate::host_env::fs::open_write(&path) {
             Ok(f) => f,
@@ -2422,7 +2511,28 @@ pub(super) mod _os {
         let mut supports = super::platform::module::support_funcs();
         supports.extend(vec![
             SupportFunc::new("open", Some(false), Some(OPEN_DIR_FD), Some(false)),
-            SupportFunc::new("access", Some(false), Some(false), None),
+            SupportFunc::new(
+                "access",
+                Some(false),
+                Some(ACCESS_DIR_FD),
+                Some(cfg!(all(
+                    unix,
+                    not(any(
+                        target_os = "espidf",
+                        target_os = "horizon",
+                        target_os = "vita",
+                    )),
+                ))),
+            )
+            .with_effective_ids(Some(cfg!(all(
+                unix,
+                not(any(
+                    target_os = "android",
+                    target_os = "espidf",
+                    target_os = "horizon",
+                    target_os = "vita",
+                )),
+            )))),
             SupportFunc::new("chdir", None, Some(false), Some(false)),
             // chflags Some, None Some
             SupportFunc::new("link", Some(false), Some(false), Some(cfg!(unix))),
@@ -2438,6 +2548,7 @@ pub(super) mod _os {
             SupportFunc::new("rmdir", Some(false), Some(RMDIR_DIR_FD), Some(false)),
             SupportFunc::new("scandir", Some(SCANDIR_FD), Some(false), Some(false)),
             SupportFunc::new("stat", Some(true), Some(STAT_DIR_FD), Some(true)),
+            SupportFunc::new("lstat", Some(false), Some(STAT_DIR_FD), Some(false)),
             SupportFunc::new("fstat", Some(false), Some(false), Some(false)),
             SupportFunc::new("symlink", Some(false), Some(SYMLINK_DIR_FD), Some(false)),
             SupportFunc::new("truncate", Some(true), Some(false), Some(false)),
@@ -2463,6 +2574,7 @@ pub(crate) struct SupportFunc {
     fd: Option<bool>,
     dir_fd: Option<bool>,
     follow_symlinks: Option<bool>,
+    effective_ids: Option<bool>,
 }
 
 impl SupportFunc {
@@ -2477,7 +2589,13 @@ impl SupportFunc {
             fd,
             dir_fd,
             follow_symlinks,
+            effective_ids: None,
         }
+    }
+
+    pub(crate) const fn with_effective_ids(mut self, effective_ids: Option<bool>) -> Self {
+        self.effective_ids = effective_ids;
+        self
     }
 }
 
@@ -2486,6 +2604,7 @@ pub fn module_exec(vm: &VirtualMachine, module: &Py<PyModule>) -> PyResult<()> {
     let supports_fd = PySet::default().into_ref(&vm.ctx);
     let supports_dir_fd = PySet::default().into_ref(&vm.ctx);
     let supports_follow_symlinks = PySet::default().into_ref(&vm.ctx);
+    let supports_effective_ids = PySet::default().into_ref(&vm.ctx);
     for support in support_funcs {
         let func_obj = module.get_attr(support.name, vm)?;
         if support.fd.unwrap_or(false) {
@@ -2495,7 +2614,10 @@ pub fn module_exec(vm: &VirtualMachine, module: &Py<PyModule>) -> PyResult<()> {
             supports_dir_fd.clone().add(func_obj.clone(), vm)?;
         }
         if support.follow_symlinks.unwrap_or(false) {
-            supports_follow_symlinks.clone().add(func_obj, vm)?;
+            supports_follow_symlinks.clone().add(func_obj.clone(), vm)?;
+        }
+        if support.effective_ids.unwrap_or(false) {
+            supports_effective_ids.clone().add(func_obj, vm)?;
         }
     }
 
@@ -2503,6 +2625,7 @@ pub fn module_exec(vm: &VirtualMachine, module: &Py<PyModule>) -> PyResult<()> {
         "supports_fd" => supports_fd,
         "supports_dir_fd" => supports_dir_fd,
         "supports_follow_symlinks" => supports_follow_symlinks,
+        "supports_effective_ids" => supports_effective_ids,
         "error" => vm.ctx.exceptions.os_error.to_owned(),
     });
 

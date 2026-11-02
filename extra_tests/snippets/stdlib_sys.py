@@ -69,6 +69,169 @@ sys.settrace(None)
 
 assert ("demo", "call", None) in events
 
+# The eager iterator prefix of a generator expression is not traced, but
+# monitoring still reports the error it raises.
+
+
+class GoodIterable:
+    def __iter__(self):
+        return iter([1])
+
+
+class BadIterable:
+    def __iter__(self):
+        raise ValueError("eager iterator")
+
+
+def create_genexpr(iterable):
+    return (value for value in iterable)
+
+
+events = []
+
+
+def trc(frame, event, arg):
+    if frame.f_code.co_name in ("create_genexpr", "<genexpr>", "__iter__"):
+        events.append((frame.f_code.co_name, event))
+    return trc
+
+
+sys.settrace(trc)
+try:
+    create_genexpr(GoodIterable()).close()
+    try:
+        create_genexpr(BadIterable())
+    except ValueError as error:
+        tb_names = []
+        tb = error.__traceback__
+        while tb is not None:
+            tb_names.append(tb.tb_frame.f_code.co_name)
+            tb = tb.tb_next
+    else:
+        raise AssertionError("expected eager iterator error")
+finally:
+    sys.settrace(None)
+assert events == [
+    ("create_genexpr", "call"),
+    ("create_genexpr", "line"),
+    ("__iter__", "call"),
+    ("__iter__", "line"),
+    ("__iter__", "return"),
+    ("create_genexpr", "return"),
+    ("create_genexpr", "call"),
+    ("create_genexpr", "line"),
+    ("__iter__", "call"),
+    ("__iter__", "line"),
+    ("__iter__", "exception"),
+    ("__iter__", "return"),
+    ("create_genexpr", "exception"),
+    ("create_genexpr", "return"),
+    ("create_genexpr", "exception"),
+    ("create_genexpr", "return"),
+], events
+assert tb_names == ["<module>", "create_genexpr", "__iter__"], tb_names
+
+monitoring = sys.monitoring
+event_names = ("PY_START", "PY_RESUME", "PY_UNWIND", "RAISE", "LINE", "INSTRUCTION")
+records = []
+monitoring.use_tool_id(2, "genexpr-prefix")
+try:
+    for name in event_names:
+
+        def callback(code, *args, name=name):
+            if code.co_name == "<genexpr>":
+                records.append(name)
+
+        monitoring.register_callback(2, getattr(monitoring.events, name), callback)
+    monitoring.set_events(
+        2, sum(getattr(monitoring.events, name) for name in event_names)
+    )
+    create_genexpr(GoodIterable()).close()
+    assert records == [], records
+    with assert_raises(ValueError):
+        create_genexpr(BadIterable())
+finally:
+    monitoring.set_events(2, 0)
+    monitoring.free_tool_id(2)
+assert records == ["RAISE", "PY_UNWIND"], records
+
+# A loop body large enough to require EXTENDED_ARG on its jump targets.
+namespace = {}
+exec(
+    "def large_loop(skip=False):\n if skip:\n  return 'done'\n"
+    " total = 0\n for x in (1, 2):\n" + "  total += x\n" * 100 + " return total\n",
+    namespace,
+)
+large_loop = namespace["large_loop"]
+
+
+def jump_out_of_large_loop(code, line):
+    global loop_hits
+    if code is large_loop.__code__ and line == 5:
+        loop_hits += 1
+        if loop_hits == 2:
+            sys._getframe(1).f_lineno = 3
+
+
+def jump_after_large_loop(code, line):
+    if code is large_loop.__code__ and line == 5:
+        sys._getframe(1).f_lineno = 106
+
+
+monitoring.use_tool_id(2, "extended-arg")
+try:
+    for event in (monitoring.events.LINE, monitoring.events.INSTRUCTION):
+        monitoring.register_callback(2, event, lambda *args: None)
+    for events in (
+        monitoring.events.LINE,
+        monitoring.events.LINE | monitoring.events.INSTRUCTION,
+    ):
+        monitoring.set_local_events(2, large_loop.__code__, events)
+        assert large_loop() == 300
+    loop_hits = 0
+    monitoring.register_callback(2, monitoring.events.LINE, jump_out_of_large_loop)
+    monitoring.set_local_events(2, large_loop.__code__, monitoring.events.LINE)
+    assert large_loop() == "done"
+    assert loop_hits == 2
+    monitoring.register_callback(2, monitoring.events.LINE, jump_after_large_loop)
+    assert large_loop() == 0
+finally:
+    monitoring.set_local_events(2, large_loop.__code__, 0)
+    for event in (monitoring.events.LINE, monitoring.events.INSTRUCTION):
+        monitoring.register_callback(2, event, None)
+    monitoring.free_tool_id(2)
+
+
+# Combined instruction events must preserve loop-header line events.
+def monitored_loop():
+    total = 0
+    for value in (1, 2):
+        total += value
+    return total
+
+
+lines = []
+monitoring.use_tool_id(2, "combined-lines")
+try:
+    monitoring.register_callback(
+        2,
+        monitoring.events.LINE,
+        lambda code, line: lines.append(line - code.co_firstlineno),
+    )
+    monitoring.register_callback(2, monitoring.events.INSTRUCTION, lambda *args: None)
+    monitoring.set_local_events(
+        2,
+        monitored_loop.__code__,
+        monitoring.events.LINE | monitoring.events.INSTRUCTION,
+    )
+    assert monitored_loop() == 3
+    assert lines == [1, 2, 3, 2, 3, 2, 4]
+finally:
+    monitoring.set_local_events(2, monitored_loop.__code__, 0)
+    for event in (monitoring.events.LINE, monitoring.events.INSTRUCTION):
+        monitoring.register_callback(2, event, None)
+    monitoring.free_tool_id(2)
+
 assert sys.exc_info() == (None, None, None)
 
 try:

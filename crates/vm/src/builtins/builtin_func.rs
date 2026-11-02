@@ -78,7 +78,7 @@ impl PyNativeFunction {
         self.zelf.as_deref().or(self.module_object.as_deref())
     }
 
-    pub const fn as_func(&self) -> &'static dyn PyNativeFn {
+    pub const fn as_func(&self) -> &dyn PyNativeFn {
         self.value.func
     }
 }
@@ -195,13 +195,9 @@ impl PyNativeFunction {
     // meth_get__self__ in CPython
     #[pygetset]
     fn __self__(zelf: NativeFunctionOrMethod, vm: &VirtualMachine) -> PyObjectRef {
-        if let Some(bound) = &zelf.0.zelf {
-            return bound.clone();
-        }
-        if let Some(module) = &zelf.0.module_object {
-            return module.clone();
-        }
-        vm.ctx.none()
+        zelf.0
+            .get_self()
+            .map_or_else(|| vm.ctx.none(), ToOwned::to_owned)
     }
 
     // meth_reduce: the name when unbound or bound to a module, otherwise
@@ -243,10 +239,12 @@ impl PyNativeFunction {
     name = "builtin_method",
     module = false,
     base = PyNativeFunction,
-    ctx = "builtin_method_type"
+    ctx = "builtin_method_type",
+    traverse
 )]
 pub struct PyNativeMethod {
     pub(crate) func: PyNativeFunction,
+    #[pytraverse(skip)]
     pub(crate) class: &'static Py<PyType>,
 }
 
@@ -333,6 +331,12 @@ pub(crate) fn init(context: &'static Context) {
         .slots
         .vectorcall
         .store(Some(vectorcall_native_function));
+    context
+        .types
+        .builtin_function_or_method_type
+        .slots
+        .flags
+        .insert(crate::types::PyTypeFlags::HAVE_VECTORCALL);
     PyNativeMethod::extend_class(context, context.types.builtin_method_type);
 }
 

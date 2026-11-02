@@ -39,7 +39,7 @@ pub struct PyMethodDescriptor {
     #[pymember(name = "__objclass__", path = "typ")]
     #[pymember(name = "__name__", path = "name")]
     pub common: PyDescriptor,
-    pub method: &'static PyMethodDef,
+    pub(crate) method: &'static PyMethodDef,
     // vectorcall: vector_call_func,
     /// Prevent HeapMethodDef from being freed while this descriptor references it
     pub(crate) _method_def_owner: Option<PyObjectRef>,
@@ -126,7 +126,8 @@ impl Callable for PyMethodDescriptor {
 
 impl PyMethodDescriptor {
     pub fn bind(&self, obj: PyObjectRef, ctx: &Context) -> PyRef<PyNativeFunction> {
-        self.method.build_bound_function(ctx, obj)
+        self.method
+            .build_bound_function_with_owner(ctx, obj, self._method_def_owner.clone())
     }
 }
 
@@ -181,7 +182,7 @@ pub struct PyClassMethodDescriptor {
     #[pymember(name = "__objclass__", path = "typ")]
     #[pymember(name = "__name__", path = "name")]
     pub common: PyDescriptor,
-    pub method: &'static PyMethodDef,
+    pub(crate) method: &'static PyMethodDef,
     pub(crate) _method_def_owner: Option<PyObjectRef>,
 }
 
@@ -199,7 +200,8 @@ impl PyClassMethodDescriptor {
     }
 
     pub fn bind(&self, obj: PyObjectRef, ctx: &Context) -> PyRef<PyNativeFunction> {
-        self.method.build_bound_function(ctx, obj)
+        self.method
+            .build_bound_function_with_owner(ctx, obj, self._method_def_owner.clone())
     }
 }
 
@@ -543,12 +545,6 @@ impl MemberCell for core::sync::atomic::AtomicU32 {}
 // One object pointer. Readonly members may be a plain pointer. Writable
 // members are an atomic cell: `PyAtomicRef<PyObject>` when the pointer is
 // never null, or `PyAtomicRef<Option<PyObject>>` when it may be.
-impl MemberLayout for PyObjectRef {
-    const KIND: MemberKind = MemberKind::Object;
-}
-impl MemberLayout for Option<PyObjectRef> {
-    const KIND: MemberKind = MemberKind::Object;
-}
 impl MemberLayout for crate::object::PyObjectCell {
     const KIND: MemberKind = MemberKind::Object;
     const ATOMIC: bool = true;
@@ -1662,6 +1658,11 @@ pub(crate) fn init(ctx: &'static Context) {
         .slots
         .vectorcall
         .store(Some(vectorcall_method_descriptor));
+    ctx.types
+        .method_descriptor_type
+        .slots
+        .flags
+        .insert(crate::types::PyTypeFlags::HAVE_VECTORCALL);
     PyClassMethodDescriptor::extend_class(ctx, ctx.types.classmethod_descriptor_type);
     PyWrapper::extend_class(ctx, ctx.types.wrapper_descriptor_type);
     ctx.types
@@ -1669,6 +1670,11 @@ pub(crate) fn init(ctx: &'static Context) {
         .slots
         .vectorcall
         .store(Some(vectorcall_wrapper));
+    ctx.types
+        .wrapper_descriptor_type
+        .slots
+        .flags
+        .insert(crate::types::PyTypeFlags::HAVE_VECTORCALL);
     PyMethodWrapper::extend_class(ctx, ctx.types.method_wrapper_type);
 }
 
@@ -2061,7 +2067,7 @@ impl Callable for PyWrapper {
 
 #[pyclass(
     with(GetDescriptor, Callable, Representable),
-    flags(DISALLOW_INSTANTIATION)
+    flags(DISALLOW_INSTANTIATION, METHOD_DESCRIPTOR)
 )]
 impl Py<PyWrapper> {
     #[pymethod]
